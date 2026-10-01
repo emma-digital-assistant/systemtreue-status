@@ -84,6 +84,6 @@ jobs:
             dedupeKey: $d, push: true }')
           code=$(curl -s -o antwort.txt -m 20 -w "%{http_code}" -X POST "$COCKPIT_URL/api/cards/snooze" \
             -H "Authorization: Bearer $PUSH_SEND_SECRET" -H "Content-Type: application/json" -d "$payload" || true)
-          echo "Cockpit-Antwort HTTP $code"; head -c 300 antwort.txt; echo
+          echo "Cockpit-Antwort HTTP $code"; jq -c '{ok, sent, karte: .card.id, titel: .card.title}' antwort.txt 2>/dev/null || head -c 300 antwort.txt; echo
           echo "::error::Nicht erreichbar: $KAPUTT"
           exit 1
