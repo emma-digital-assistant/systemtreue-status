@@ -1,0 +1,89 @@
+name: Erreichbarkeit systemtreue
+
+# Externe Erreichbarkeitspruefung fuer das SK Trading Journal.
+# Laeuft auf GitHub-Rechnern, also AUSSERHALB des Hetzner-Servers 46.225.20.230:
+# faellt der Server ganz aus, merkt es dieser Waechter trotzdem.
+#
+# Alarm: Cockpit-Karte mit Push (POST /api/cards/snooze, Bearer PUSH_SEND_SECRET).
+# Ist auch das Cockpit weg (liegt auf DEMSELBEN Server), schlaegt der Lauf rot fehl
+# -> GitHub schickt die Fehler-Mail an das Konto. Zweiter Weg, unabhaengig vom Server.
+#
+# Secrets: COCKPIT_URL (z. B. https://cockpit.example), PUSH_SEND_SECRET.
+# Karte t_f3e1a1ae (Board sk), 01.10.2026, Jonas.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      probe_url:
+        description: "Nur fuer den Probe-Alarm: absichtlich kaputte URL zusaetzlich pruefen"
+        required: false
+        default: ""
+
+concurrency:
+  group: erreichbarkeit
+  cancel-in-progress: false
+
+jobs:
+  pruefen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      # Oeffentliche Repos: GitHub schaltet Zeitplan-Laeufe nach 60 Tagen ohne
+      # Repo-Aktivitaet ab. Das erneute "enable" ueber die API setzt diese Uhr
+      # zurueck (gleicher Weg wie keepalive-workflow v2). Kostet einen API-Aufruf.
+      - name: Zeitplan wachhalten
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/erreichbarkeit.yml/enable" || true
+
+      - name: Seiten pruefen (2 Versuche je Seite)
+        id: pruefen
+        env:
+          PROBE_URL: ${{ github.event.inputs.probe_url }}
+        run: |
+          set -u
+          ziele=("https://app.systemtreue.de/login" "https://systemtreue.de/")
+          if [ -n "${PROBE_URL:-}" ]; then ziele+=("$PROBE_URL"); fi
+          kaputt=""
+          for u in "${ziele[@]}"; do
+            ok=0
+            for versuch in 1 2; do
+              code=$(curl -s -o /dev/null -m 20 -w "%{http_code}" "$u" || true)
+              echo "$u -> $code (Versuch $versuch)"
+              if [ "$code" = "200" ]; then ok=1; break; fi
+              sleep 20
+            done
+            if [ $ok -eq 0 ]; then kaputt="$kaputt $u (HTTP $code)"; fi
+          done
+          echo "kaputt=${kaputt# }" >> "$GITHUB_OUTPUT"
+
+      - name: Alarm -> Cockpit-Karte mit Push
+        if: steps.pruefen.outputs.kaputt != ''
+        env:
+          COCKPIT_URL: ${{ secrets.COCKPIT_URL }}
+          PUSH_SEND_SECRET: ${{ secrets.PUSH_SEND_SECRET }}
+          KAPUTT: ${{ steps.pruefen.outputs.kaputt }}
+          PROBE_URL: ${{ github.event.inputs.probe_url }}
+          LAUF: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          tag=$(TZ=Europe/Berlin date +%F)
+          zeit=$(TZ=Europe/Berlin date '+%d.%m. %H:%M')
+          titel="systemtreue nicht erreichbar"
+          dedupe="systemtreue-down-$tag"
+          if [ -n "${PROBE_URL:-}" ]; then titel="PROBE-Alarm (Test, bitte ignorieren)"; dedupe="systemtreue-probe-${{ github.run_id }}"; fi
+          payload=$(jq -n --arg k "$KAPUTT" --arg l "$LAUF" --arg z "$zeit" --arg d "$dedupe" --arg t "$titel" '{
+            action: "create",
+            title: $t,
+            sub: ("seit " + $z + " (Berlin)"),
+            body: ("Von aussen (GitHub) nicht erreichbar: " + $k + "\nPruefung: " + $l + "\nErste Hilfe: ssh Server, systemctl --user status sk-journal, Caddy pruefen."),
+            project: "emma", cardKind: "info", size: "1x1",
+            dedupeKey: $d, push: true }')
+          code=$(curl -s -o antwort.txt -m 20 -w "%{http_code}" -X POST "$COCKPIT_URL/api/cards/snooze" \
+            -H "Authorization: Bearer $PUSH_SEND_SECRET" -H "Content-Type: application/json" -d "$payload" || true)
+          echo "Cockpit-Antwort HTTP $code"; head -c 300 antwort.txt; echo
+          echo "::error::Nicht erreichbar: $KAPUTT"
+          exit 1
